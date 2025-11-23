@@ -4,9 +4,16 @@
  */
 
 #include "A6Header.h"
+#include "Graphs/ConsG.h"
+#include "Graphs/ConsGNode.h"
+#include "Graphs/ConsGEdge.h"
+#include "Util/SVFUtil.h"
+#include "Util/WorkList.h"
 
 using namespace llvm;
 using namespace std;
+using namespace SVF;
+
 
 int main(int argc, char** argv)
 {
@@ -40,141 +47,149 @@ void Andersen::runPointerAnalysis()
     //  The implementation of constraint graph is provided in the SVF library
         // TODO: complete this method. Point-to set and worklist are defined in A5Header.h
     //  The implementation of constraint graph is provided in the SVF library
-        using namespace SVF;
+    WorkList<NodeID> workList;
 
-    WorkList<NodeID> worklist;
-
-    /// Step 1. 初始化：为空的 pts，并把所有节点入队
+    // ==========================================
+    // 1. Address Rule (Initialization)
+    // ==========================================
+    // Pseudocode: for each o --Address--> p
     for (auto it = consg->begin(); it != consg->end(); ++it)
     {
-        NodeID id = it->first;
-        pts[id] = {}; // 空集合
-        worklist.push(id);
-    }
+        ConstraintNode* node = it->second;
+        NodeID o = node->getId(); // node represents object o
 
-    /// Step 2. 主循环
-    while (!worklist.empty())
-    {
-        NodeID p = worklist.pop();
-        ConstraintNode* node = consg->getConstraintNode(p);
-        bool changed = false;
-
-        /// ========== Address Rule ==========
         for (auto edge : node->getAddrOutEdges())
         {
-            if (auto addrEdge = SVFUtil::dyn_cast<AddrCGEdge>(edge))
+            auto addrEdge = SVFUtil::dyn_cast<AddrCGEdge>(edge);
+            if (!addrEdge) continue;
+
+            NodeID p = addrEdge->getDstID(); // destination pointer p
+
+            // pts(p) = {o}
+            if (pts[p].insert(o).second)
             {
-                NodeID x = addrEdge->getDstID();
-                if (pts[p].insert(x).second)
-                    changed = true;
+                workList.push(p);
             }
         }
+    }
 
-        if (changed)
-        {
-            worklist.push(p);
-            changed = false;
-        }
+    // ==========================================
+    // 2. Propagation (Main Worklist Loop)
+    // ==========================================
+    while (!workList.empty())
+    {
+        NodeID p = workList.pop();
+        ConstraintNode* nodeP = consg->getGNode(p);
+        if (!nodeP) continue;
 
-        /// ========== Copy Rule ==========
-        for (auto edge : node->getCopyOutEdges())
+        // -------------------------------------------------------
+        // Store Rule: *p = q   (q --Store--> p)
+        // -------------------------------------------------------
+        for (auto edge : nodeP->getInEdges())
         {
-            if (auto copyEdge = SVFUtil::dyn_cast<CopyCGEdge>(edge))
+            auto storeEdge = SVFUtil::dyn_cast<StoreCGEdge>(edge);
+            if (!storeEdge) continue;
+
+            NodeID q = storeEdge->getSrcID();
+
+            for (auto o : pts[p])
             {
-                NodeID q = copyEdge->getDstID();
-                for (auto obj : pts[q])
+                ConstraintNode* qNode = consg->getGNode(q);
+                ConstraintNode* oNode = consg->getGNode(o);
+
+                // Add q -> o as Copy edge if not exist
+                if (!consg->hasEdge(qNode, oNode, ConstraintEdge::Copy))
                 {
-                    if (pts[p].insert(obj).second)
-                        changed = true;
+                    consg->addCopyCGEdge(q, o);
+                    workList.push(q);
                 }
             }
         }
 
-        if (changed)
+        // -------------------------------------------------------
+        // Load Rule: r = *p   (p --Load--> r)
+        // -------------------------------------------------------
+        for (auto edge : nodeP->getLoadOutEdges())
         {
-            worklist.push(p);
-            changed = false;
-        }
+            auto loadEdge = SVFUtil::dyn_cast<LoadCGEdge>(edge);
+            if (!loadEdge) continue;
 
-        /// ========== Load Rule ==========
-        for (auto edge : node->getLoadOutEdges())
-        {
-            if (auto loadEdge = SVFUtil::dyn_cast<LoadCGEdge>(edge))
+            NodeID r = loadEdge->getDstID();
+
+            for (auto o : pts[p])
             {
-                NodeID q = loadEdge->getDstID();
-                for (auto x : pts[q])
+                ConstraintNode* oNode = consg->getGNode(o);
+                ConstraintNode* rNode = consg->getGNode(r);
+
+                // Add o -> r as Copy edge if not exist
+                if (!consg->hasEdge(oNode, rNode, ConstraintEdge::Copy))
                 {
-                    ConstraintNode* xNode = consg->getConstraintNode(x);
-                    if (!xNode) continue;
-                    for (auto obj : pts[x])
-                    {
-                        if (pts[p].insert(obj).second)
-                            changed = true;
-                    }
+                    consg->addCopyCGEdge(o, r);
+                    workList.push(o);
                 }
             }
         }
 
-        if (changed)
+        // -------------------------------------------------------
+        // Copy Rule: x = p   (p --Copy--> x)
+        // -------------------------------------------------------
+        for (auto edge : nodeP->getCopyOutEdges())
         {
-            worklist.push(p);
-            changed = false;
-        }
+            auto copyEdge = SVFUtil::dyn_cast<CopyCGEdge>(edge);
+            if (!copyEdge) continue;
 
-        /// ========== Store Rule ==========
-        for (auto edge : node->getStoreOutEdges())
-        {
-            if (auto storeEdge = SVFUtil::dyn_cast<StoreCGEdge>(edge))
+            NodeID x = copyEdge->getDstID();
+
+            size_t oldSize = pts[x].size();
+            pts[x].insert(pts[p].begin(), pts[p].end());
+
+            if (pts[x].size() != oldSize)
             {
-                NodeID q = storeEdge->getDstID();
-                for (auto x : pts[p])
-                {
-                    for (auto obj : pts[q])
-                    {
-                        if (pts[x].insert(obj).second)
-                            changed = true;
-                    }
-                    if (changed)
-                    {
-                        worklist.push(x);
-                        changed = false;
-                    }
-                }
+                workList.push(x);
             }
         }
 
-        /// ========== Gep Rule ==========
-        /// 对于结构体成员访问：p = q + offset
-        /// ========== Gep Rule ==========
-        for (auto edge : node->getGepOutEdges())
+        // -------------------------------------------------------
+        // Gep Rule: x = gep(p, offset)
+        // -------------------------------------------------------
+        for (auto edge : nodeP->getGepOutEdges())
         {
-            if (auto gepEdge = SVFUtil::dyn_cast<GepCGEdge>(edge))
+            NodeID x = edge->getDstID();
+            u32_t offset = 0;   // default field offset
+            bool isGep = false;
+
+            // Case 1: Constant offset (e.g., struct field, array[0])
+            if (auto normalGep = SVFUtil::dyn_cast<NormalGepCGEdge>(edge))
             {
-                NodeID q = gepEdge->getDstID();
+                offset = normalGep->getConstantFieldIdx();
+                isGep = true;
+            }
+            // Case 2: Variant offset (e.g., array[i])
+            else if (auto variantGep = SVFUtil::dyn_cast<VariantGepCGEdge>(edge))
+            {
+                // API limitation: cannot extract real offset, fallback to 0
+                // Interpretation: p must already point to correct array base
+                offset = 0;
+                isGep = true;
+            }
 
-                for (auto obj : pts[q])
-                {
-                    NodeID fieldObj = 0;
+            if (!isGep) continue;
 
-                    if (auto normalGep = SVFUtil::dyn_cast<NormalGepCGEdge>(gepEdge))
-                    {
-                        const SVF::APOffset &offset = normalGep->getConstantFieldIdx();
-                        fieldObj = consg->getGepObjVar(obj, offset);
-                    }
-                    else
-                    {
-                        // Variant GEP：无固定偏移，可忽略
-                        continue;
-                    }
+            size_t oldSize = pts[x].size();
 
-                    if (pts[p].insert(fieldObj).second)
-                        changed = true;
-                }
+            for (auto o : pts[p])
+            {
+                // For constant offset: fld = o.field
+                // For variant offset: fld = o (base object)
+                NodeID fld = consg->getGepObjVar(o, offset);
+                pts[x].insert(fld);
+            }
+
+            if (pts[x].size() != oldSize)
+            {
+                workList.push(x);
             }
         }
-
-        if (changed)
-            worklist.push(p);
     }
 }
 
@@ -182,8 +197,6 @@ void Andersen::updateCallGraph(SVF::CallGraph* cg)
 {
     // TODO: complete this method.
     //  The implementation of call graph is provided in the SVF library
-    using namespace SVF;
-
     // 1. 获取所有间接调用点
     const auto& indirectCalls = consg->getIndirectCallsites();
 
